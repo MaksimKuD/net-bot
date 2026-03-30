@@ -53,6 +53,28 @@ type Order struct {
 	Active bool
 }
 
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+
+// AlertKind описывает причину, по которой ордер не был исполнен.
+type AlertKind string
+
+const (
+	// AlertInsufficientUSDT — BUY пропущен: баланс USDT меньше QuoteQty.
+	AlertInsufficientUSDT AlertKind = "insufficient_usdt"
+	// AlertInsufficientBTC — SELL пропущен: баланс BTC меньше стандартного лота.
+	// Предотвращает создание зеркального BUY на полный QuoteQty после частичной продажи (overtrade).
+	AlertInsufficientBTC AlertKind = "insufficient_btc"
+)
+
+// Alert несёт диагностическую информацию о пропущенном ордере.
+type Alert struct {
+	Kind     AlertKind
+	LevelIdx int
+	Price    float64
+	Have     float64 // фактический баланс в момент проверки
+	Need     float64 // требуемый минимум для исполнения
+}
+
 // ─── ENGINE ──────────────────────────────────────────────────────────────────
 
 type Engine struct {
@@ -66,6 +88,9 @@ type Engine struct {
 	inMarket   bool
 	mu         sync.Mutex
 	candles    []Candle
+
+	// OnAlert вызывается при каждом пропущенном ордере. Опционален: nil — тихий режим.
+	OnAlert func(Alert)
 }
 
 func NewEngine(cfg Config) *Engine {
@@ -74,6 +99,13 @@ func NewEngine(cfg Config) *Engine {
 		usdtBal: cfg.InitialUSDT,
 		orders:  make(map[int]*Order),
 		candles: make([]Candle, 0, CandleLimit),
+	}
+}
+
+// emit вызывает OnAlert, если он установлен.
+func (e *Engine) emit(a Alert) {
+	if e.OnAlert != nil {
+		e.OnAlert(a)
 	}
 }
 
@@ -166,18 +198,19 @@ func (e *Engine) executeOrder(idx int, price float64) {
 	action := ""
 	if ord.Side == 1 { // BUY
 		if e.usdtBal < e.cfg.QuoteQty {
+			e.emit(Alert{Kind: AlertInsufficientUSDT, LevelIdx: idx, Price: price,
+				Have: e.usdtBal, Need: e.cfg.QuoteQty})
 			return
 		}
 		btcToBuy := (e.cfg.QuoteQty / price) * (1 - e.cfg.FeeRate)
 		e.usdtBal -= e.cfg.QuoteQty
 		e.btcBal += btcToBuy
 		action = fmt.Sprintf("Куплено %.6f BTC", btcToBuy)
-	} else { // SELL
+	} else { // SELL — симметричный guard: отклоняем, если BTC меньше полного лота
 		qtyToSell := e.cfg.QuoteQty / price
 		if e.btcBal < qtyToSell {
-			qtyToSell = e.btcBal
-		}
-		if qtyToSell <= 0 {
+			e.emit(Alert{Kind: AlertInsufficientBTC, LevelIdx: idx, Price: price,
+				Have: e.btcBal, Need: qtyToSell})
 			return
 		}
 		e.usdtBal += qtyToSell * price * (1 - e.cfg.FeeRate)
@@ -385,6 +418,10 @@ func main() {
 	}
 
 	engine := NewEngine(cfg)
+	engine.OnAlert = func(a Alert) {
+		log.Printf("⚠️  ALERT [%s] уровень=%d цена=%.2f имеется=%.6f нужно=%.6f",
+			a.Kind, a.LevelIdx, a.Price, a.Have, a.Need)
+	}
 
 	fmt.Printf("🚀 Запуск Paper Trading | Символ: %s | Начальный баланс: %.0f USDT\n",
 		symbol, cfg.InitialUSDT)
